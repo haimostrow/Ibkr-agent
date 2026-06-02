@@ -7,14 +7,13 @@ const cron = require('node-cron');
 const app = express();
 app.use(express.json());
 
-// ── CONFIG DESDE VARIABLES DE ENTORNO (Railway) ────────────────────────────
 const {
   ANTHROPIC_API_KEY,
   TWILIO_SID,
   TWILIO_TOKEN,
-  TWILIO_FROM,       // whatsapp:+14155238886
-  TWILIO_TO,         // whatsapp:+50766713170
-  IBKR_URL,          // https://localhost:5000 o URL del gateway
+  TWILIO_FROM,
+  TWILIO_TO,
+  IBKR_URL,
   IBKR_ACCOUNT,
   MIN_CONFIDENCE = '90',
   SCAN_INTERVAL_MIN = '30',
@@ -28,7 +27,6 @@ let scanCount = 0;
 let alertsSent = [];
 let lastScanResults = [];
 
-// ── MARKET DATA (Yahoo Finance) ────────────────────────────────────────────
 function calcEMA(data, period) {
   const k = 2 / (period + 1);
   let ema = [data[0]];
@@ -77,7 +75,6 @@ async function fetchMarketData(ticker) {
   };
 }
 
-// ── CLAUDE ANALYSIS ────────────────────────────────────────────────────────
 async function analyzeWithClaude(md) {
   const sys = `Eres un agente cuantitativo. Responde SOLO con JSON válido sin markdown:
 {"action":"COMPRAR"|"MANTENER"|"VENDER"|"SALIR","confidence":1-100,"entry_price":number|null,"stop_loss":number|null,"target_price":number|null,"timeframe":"corto plazo"|"mediano plazo"|"largo plazo","rationale":"max 2 oraciones en español","ibkr_order_type":"MKT"|"LMT"|"STP","ibkr_order_detail":"string","risk_reward":number|null}`;
@@ -92,7 +89,6 @@ async function analyzeWithClaude(md) {
   return JSON.parse(text.replace(/```json|```/g, '').trim());
 }
 
-// ── IBKR ORDER EXECUTION ───────────────────────────────────────────────────
 async function getConid(ticker) {
   const { data } = await axios.get(
     `${IBKR_URL}/v1/api/iserver/secdef/search?symbol=${ticker}&name=true&secType=STK`,
@@ -107,24 +103,17 @@ async function placeIBKROrder(ticker, action, orderType, price, qty = 1) {
   const conid = await getConid(ticker);
   const body = {
     orders: [{
-      acctId: IBKR_ACCOUNT,
-      conid,
-      orderType,
-      side,
-      quantity: qty,
-      price: parseFloat(price),
-      tif: 'DAY'
+      acctId: IBKR_ACCOUNT, conid, orderType, side,
+      quantity: qty, price: parseFloat(price), tif: 'DAY'
     }]
   };
   const { data } = await axios.post(
     `${IBKR_URL}/v1/api/iserver/account/${IBKR_ACCOUNT}/orders`,
-    body,
-    { timeout: 10000 }
+    body, { timeout: 10000 }
   );
   return data;
 }
 
-// ── WHATSAPP ALERT ─────────────────────────────────────────────────────────
 function buildMessage(md, analysis) {
   const emoji = analysis.action.includes('COMPRAR') ? '🟢' :
     (analysis.action.includes('VENDER') || analysis.action.includes('SALIR')) ? '🔴' : '🟡';
@@ -144,123 +133,85 @@ ${analysis.rationale}
 
 async function sendWhatsApp(message) {
   return await twilioClient.messages.create({
-    from: TWILIO_FROM,
-    to: TWILIO_TO,
-    body: message
+    from: TWILIO_FROM, to: TWILIO_TO, body: message
   });
 }
 
-// ── MARKET HOURS CHECK (ET) ───────────────────────────────────────────────
 function isMarketOpen() {
   const now = new Date();
   const et = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
-  const day = et.getDay(); // 0=Sun, 6=Sat
+  const day = et.getDay();
   if (day === 0 || day === 6) return false;
-  const hour = et.getHours();
-  const min = et.getMinutes();
-  const totalMin = hour * 60 + min;
-  return totalMin >= 570 && totalMin <= 960; // 9:30am - 4:00pm ET
+  const totalMin = et.getHours() * 60 + et.getMinutes();
+  return totalMin >= 570 && totalMin <= 960;
 }
 
-// ── MAIN SCAN ─────────────────────────────────────────────────────────────
+async function runScanForced() { return runScanInternal(true); }
 async function runScan() {
-  if (!isMarketOpen()) {
-    console.log(`[${new Date().toISOString()}] Mercado cerrado — scan omitido`);
-    return;
-  }
+  if (!isMarketOpen()) { console.log('Mercado cerrado — scan omitido'); return; }
+  return runScanInternal(false);
+}
 
+async function runScanInternal(forced = false) {
   scanCount++;
   const tickers = WATCHLIST.split(',').map(t => t.trim());
   const minConf = parseInt(MIN_CONFIDENCE);
-  console.log(`[${new Date().toISOString()}] Scan #${scanCount} iniciado — ${tickers.length} tickers`);
-
+  console.log(`[${new Date().toISOString()}] Scan #${scanCount}${forced ? ' (FORZADO)' : ''} — ${tickers.length} tickers`);
   const results = [];
-
   for (const ticker of tickers) {
     try {
       const md = await fetchMarketData(ticker);
       const analysis = await analyzeWithClaude(md);
       const shouldAlert = analysis.confidence >= minConf && analysis.action.includes('COMPRAR');
-
       results.push({ ticker, md, analysis, alerted: shouldAlert });
       console.log(`  ${ticker}: ${analysis.action} ${analysis.confidence}%${shouldAlert ? ' ← ALERTA' : ''}`);
-
       if (shouldAlert) {
-        const msg = buildMessage(md, analysis);
-        await sendWhatsApp(msg);
+        await sendWhatsApp(buildMessage(md, analysis));
         alertsSent.push({ ticker, action: analysis.action, confidence: analysis.confidence, time: new Date() });
         console.log(`  → WhatsApp enviado para ${ticker}`);
-
-        // Auto-ejecutar en IBKR si está configurado
         if (IBKR_URL && IBKR_ACCOUNT) {
           try {
-            const orderResult = await placeIBKROrder(
-              ticker,
-              analysis.action,
-              analysis.ibkr_order_type || 'LMT',
-              analysis.entry_price || md.price,
-              1
-            );
-            console.log(`  → Orden IBKR ejecutada:`, orderResult);
-            await sendWhatsApp(`✅ Orden ejecutada en IBKR: ${analysis.ibkr_order_type} ${ticker} @ $${analysis.entry_price || md.price}`);
-          } catch (e) {
-            console.error(`  → Error IBKR para ${ticker}:`, e.message);
-          }
+            await placeIBKROrder(ticker, analysis.action, analysis.ibkr_order_type || 'LMT', analysis.entry_price || md.price, 1);
+            await sendWhatsApp(`✅ Orden ejecutada en IBKR: ${ticker} @ $${analysis.entry_price || md.price}`);
+          } catch (e) { console.error(`Error IBKR ${ticker}:`, e.message); }
         }
       }
-
-      // Pequeña pausa entre tickers
       await new Promise(r => setTimeout(r, 1000));
-    } catch (e) {
-      console.error(`  Error en ${ticker}:`, e.message);
-    }
+    } catch (e) { console.error(`Error en ${ticker}:`, e.message); }
   }
-
   lastScanResults = results;
-  console.log(`[${new Date().toISOString()}] Scan #${scanCount} completo`);
+  console.log(`Scan #${scanCount} completo`);
 }
 
-// ── CRON JOB ──────────────────────────────────────────────────────────────
 const intervalMin = parseInt(SCAN_INTERVAL_MIN);
-// Corre cada N minutos, lunes a viernes
-cron.schedule(`*/${intervalMin} * * * 1-5`, () => {
-  runScan().catch(e => console.error('Error en scan:', e.message));
-});
+cron.schedule(`*/${intervalMin} * * * 1-5`, () => runScan().catch(e => console.error(e.message)));
 
-console.log(`Scanner configurado: cada ${intervalMin} minutos, lunes a viernes, horario de mercado NY`);
-
-// ── API ENDPOINTS ─────────────────────────────────────────────────────────
-app.get('/', (req, res) => {
-  res.json({
-    status: 'Agente IBKR activo',
-    scanCount,
-    alertsSent: alertsSent.length,
-    lastScan: lastScanResults.length ? lastScanResults.map(r => ({
-      ticker: r.ticker,
-      action: r.analysis.action,
-      confidence: r.analysis.confidence,
-      price: r.md.price,
-      alerted: r.alerted
-    })) : 'Sin scans aún',
-    marketOpen: isMarketOpen(),
-    nextScanInterval: `${intervalMin} minutos`,
-    watchlist: WATCHLIST.split(',')
-  });
-});
+app.get('/', (req, res) => res.json({
+  status: 'Agente IBKR activo', scanCount,
+  alertsSent: alertsSent.length,
+  lastScan: lastScanResults.length ? lastScanResults.map(r => ({
+    ticker: r.ticker, action: r.analysis.action,
+    confidence: r.analysis.confidence, price: r.md.price, alerted: r.alerted
+  })) : 'Sin scans aún',
+  marketOpen: isMarketOpen(),
+  nextScanInterval: `${intervalMin} minutos`,
+  watchlist: WATCHLIST.split(',')
+}));
 
 app.post('/scan', async (req, res) => {
   res.json({ message: 'Scan iniciado' });
   runScan().catch(e => console.error(e.message));
 });
 
-app.get('/alerts', (req, res) => {
-  res.json({ total: alertsSent.length, alerts: alertsSent });
+app.get('/scan/force', async (req, res) => {
+  res.json({ message: 'Scan forzado iniciado' });
+  runScanForced().catch(e => console.error(e.message));
 });
 
-// ── START ─────────────────────────────────────────────────────────────────
+app.get('/alerts', (req, res) => res.json({ total: alertsSent.length, alerts: alertsSent }));
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Agente IBKR corriendo en puerto ${PORT}`);
-  // Scan inicial al arrancar
   setTimeout(() => runScan().catch(e => console.error(e.message)), 3000);
 });
